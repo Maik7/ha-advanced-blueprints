@@ -240,7 +240,7 @@ class PvExcessControl:
             # Sanity check
             if (not PvExcessControl.instances) or (not self.sanity_check()):
                 return on_time
-                
+   
             # execute only if this the first instance of the dictionary (avoid two automations acting)
             #log.info(f'{self.log_prefix} I am around.')
             first_item = next(iter(PvExcessControl.instances.values()))

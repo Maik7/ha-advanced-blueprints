@@ -163,7 +163,26 @@ def pv_excess_control(automation_id, appliance_priority, export_power, pv_power,
                     grid_voltage, import_export_power, home_battery_capacity, solar_production_forecast,
                     appliance_once_only)
 
+@service
+def pv_excess_control_reset():
+    log.info(f'Resetting pv_excess_control, Deleting all {len(PvExcessControl.instances)} instances')
+    for a_id in PvExcessControl.instances: 
+        log.debug(f'Instance: {a_id}')
 
+    PvExcessControl.instances = {}
+
+@service
+def pv_excess_control_remove(automation_id):
+    automation_id = automation_id[11:] if automation_id[:11] == 'automation.' else automation_id
+    automation_id = _replace_vowels(f"automation.{automation_id.strip().replace(' ', '_').lower()}")
+    log.info(f'Pv_excess_control, removig {automation_id} from {len(PvExcessControl.instances)} instances')
+    for a_id in PvExcessControl.instances: 
+        log.debug(f'Instance: {a_id}')
+    if automation_id not in PvExcessControl.instances:
+        log.info(f'automation not found in instances. Nothing to do.')
+    else:
+        del PvExcessControl.instances[automation_id]
+        log.info(f'automation is removed. {len(PvExcessControl.instances)} instances left.')
 
 class PvExcessControl:
     # TODO:
@@ -250,6 +269,8 @@ class PvExcessControl:
         @time_trigger('period(now, 10s)')
         def on_time():
             # Sanity check
+            log.debug(f'{self.log_prefix} trigger factory pv_excess_control, currently {len(PvExcessControl.instances)} instances', )
+            
             if (not PvExcessControl.instances) or (not self.sanity_check()):
                 return on_time
                 
@@ -269,6 +290,7 @@ class PvExcessControl:
             # ----------------------------------- go through each appliance (highest prio to lowest) ---------------------------------------
             # this is for determining which devices can be switched on
             instances = []
+            switched_off_aplliance_to_switch_on_higher_prioritized_one = False
             for a_id, e in PvExcessControl.instances.copy().items():
                 inst = e['instance']
                 inst.switch_interval_counter += 1
@@ -286,7 +308,8 @@ class PvExcessControl:
                 if home_battery_level >= PvExcessControl.min_home_battery_level or not self._force_charge_battery():
                     # home battery charge is high enough to direct solar power to appliances, if solar power is higher than load power
                     # calc avg based on pv excess (solar power - load power) according to specified window
-                    avg_excess_power = int(sum(PvExcessControl.pv_history[-inst.appliance_switch_interval:]) / min([1,inst.appliance_switch_interval]))
+                    avg_power_window = min(1,max(6,inst.appliance_switch_interval))
+                    avg_excess_power = int(sum(PvExcessControl.pv_history[-avg_power_window:]) / avg_power_window)
                     log.debug(f'{log_prefix} Home battery charge is sufficient ({home_battery_level}/{PvExcessControl.min_home_battery_level} %)'
                               f' OR remaining solar forecast is higher than remaining capacity of home battery. '
                               f'Calculated average excess power based on >> solar power - load power <<: {avg_excess_power} W')
@@ -295,7 +318,7 @@ class PvExcessControl:
                     # home battery charge is not yet high enough OR battery force charge is necessary.
                     # Only use excess power (which would otherwise be exported to the grid) for appliance
                     # calc avg based on export power history according to specified window
-                    avg_excess_power = int(sum(PvExcessControl.export_history[-inst.appliance_switch_interval:]) / min([1,inst.appliance_switch_interval]))
+                    avg_excess_power = int(sum(PvExcessControl.export_history[-min(1,inst.appliance_switch_interval):]) / min([1,inst.appliance_switch_interval]))
                     log.debug(f'{log_prefix} Home battery charge is not sufficient ({home_battery_level}/{PvExcessControl.min_home_battery_level} %), '
                               f'OR remaining solar forecast is lower than remaining capacity of home battery. '
                               f'Calculated average excess power based on >> export power <<: {avg_excess_power} W')
@@ -344,6 +367,18 @@ class PvExcessControl:
                         else:
                             log.debug(f'{log_prefix} Cannot switch on appliance, because appliance switch interval is not reached '
                                       f'({inst.switch_interval_counter}/{inst.appliance_switch_interval}).')
+                    elif (not switched_off_aplliance_to_switch_on_higher_prioritized_one) and (self.calculate_pwr_reducible(inst.appliance_priority) + avg_excess_power) >= (defined_power if inst.appliance_priority <= 500 else 0):
+                        # excess power is sufficent by switching off lower prioritized appliance(s)
+                        if inst.switch_interval_counter >= inst.appliance_switch_interval:
+                            self.switch_on(inst)
+                            inst.switch_interval_counter = 0
+                            switched_off_aplliance_to_switch_on_higher_prioritized_one = True
+                            log.info(f'{log_prefix} Average Excess power will be high enough by switching off lower prioritized appliance(s). Switched on appliance.')
+                            # "restart" history by subtracting defined power from each history value within the specified time frame
+                            self._adjust_pwr_history(inst, -defined_power)
+                            task.sleep(1)
+                            if inst.dynamic_current_appliance:
+                                _set_value(inst.appliance_current_set_entity, inst.min_current)
                     else:
                         log.debug(f'{log_prefix} Average Excess power not high enough to switch on appliance.')
                 # -------------------------------------------------------------------
@@ -597,3 +632,32 @@ class PvExcessControl:
                 self.switch_off(inst)
             return True
         return False
+
+
+    def calculate_pwr_reducible(self, max_priority):
+        """
+        Calculates the reduicible power by switching off all aplicances, which van be switched off and have a priority below max_priority
+        :param  max_priority: see description
+        :return:              reducible power
+        """
+        pwr_reducible = 0
+        for a_id, e in PvExcessControl.instances.copy().items():
+            inst = e['instance']
+            if not self.automation_activated(inst.automation_id):
+                continue
+            # Do not turn off only-on-appliances
+            if inst.appliance_on_only:
+                continue
+            # Do not turn off if switch interval not reached
+            if inst.switch_interval_counter < inst.appliance_switch_interval:
+                continue
+            if inst.appliance_priority >= max_priority:
+                continue
+            if _get_state(inst.appliance_switch) != 'on':
+                continue
+            if inst.actual_power is None:
+                pwr_reducible += inst.defined_current * PvExcessControl.grid_voltage * inst.phases
+            else:
+                pwr_reducible += _get_num_state(inst.actual_power)
+        
+        return pwr_reducible
